@@ -2,6 +2,8 @@ const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
 const path = require("path");
+const http = require("http");
+const { Server } = require("socket.io");
 require("dotenv").config({ path: path.resolve(__dirname, ".env") });
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
@@ -21,6 +23,29 @@ const pool = new Pool({
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev_secret_change_me";
+
+// Create HTTP server and Socket.IO
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+    credentials: true,
+  },
+});
+
+io.on("connection", (socket) => {
+  // Client should emit 'authenticate' with JWT to join personal room
+  socket.on("authenticate", (token) => {
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      const room = `user-${payload.userId}`;
+      socket.join(room);
+      socket.emit("authenticated", { ok: true });
+    } catch (_e) {
+      socket.emit("auth_error", { error: "Invalid token" });
+    }
+  });
+});
 
 // Ensure table exists and migrate schema (idempotent)
 async function initDb() {
@@ -262,13 +287,19 @@ app.post("/tasks", authOptional, async (req, res) => {
       `INSERT INTO tasks (${cols.join(", ")}) VALUES (${placeholders.join(", ")}) RETURNING *`,
       vals
     );
-    res.json(result.rows[0]);
+    const task = result.rows[0];
+    // Emit real-time event to owner room if authenticated
+    if (req.user) {
+      io.to(`user-${req.user.id}`).emit("task_created", task);
+    } else {
+      io.emit("task_created", task);
+    }
+    res.json(task);
   } catch (err) {
     console.error("POST /tasks error:", err);
     res.status(500).json({ error: "Failed to create task" });
   }
 });
-
 
 app.put("/tasks/:id", authOptional, async (req, res) => {
   try {
@@ -324,20 +355,46 @@ app.put("/tasks/:id", authOptional, async (req, res) => {
       values.push(Boolean(important));
     }
     fields.push(`updated_at=NOW()`);
+
     // ownership condition if authenticated
     if (req.user) {
+      // Load old task for comparison (assignment changes)
+      const prev = await pool.query(`SELECT * FROM tasks WHERE id=$1 AND user_id=$2`, [id, req.user.id]);
+      const oldTask = prev.rows[0];
       values.push(id);
       values.push(req.user.id);
       const query = `UPDATE tasks SET ${fields.join(", ")} WHERE id=$${idx++} AND user_id=$${idx} RETURNING *`;
       const result = await pool.query(query, values);
       if (!result.rowCount) return res.status(404).json({ error: "Task not found" });
-      return res.json(result.rows[0]);
+      const updated = result.rows[0];
+      io.to(`user-${req.user.id}`).emit("task_updated", updated);
+      // Notify new assignee if changed
+      if (oldTask && updated.assigned_to && updated.assigned_to !== oldTask.assigned_to) {
+        io.to(`user-${updated.assigned_to}`).emit("notification", {
+          type: "TASK_ASSIGNED",
+          title: "New Task Assigned",
+          message: `You have been assigned: ${updated.title}`,
+          taskId: updated.id,
+        });
+      }
+      // Optionally notify previous assignee
+      if (oldTask && oldTask.assigned_to && updated.assigned_to !== oldTask.assigned_to) {
+        io.to(`user-${oldTask.assigned_to}`).emit("notification", {
+          type: "TASK_UNASSIGNED",
+          title: "Task Unassigned",
+          message: `You are no longer assigned: ${oldTask.title}`,
+          taskId: oldTask.id,
+        });
+      }
+      return res.json(updated);
     }
     // legacy: no auth
     values.push(id);
     const query = `UPDATE tasks SET ${fields.join(", ")} WHERE id=$${idx} RETURNING *`;
     const result = await pool.query(query, values);
-    res.json(result.rows[0] || { success: true });
+    const updated = result.rows[0] || { id, ...req.body };
+    io.emit("task_updated", updated);
+    res.json(updated);
   } catch (err) {
     console.error("PUT /tasks/:id error:", err);
     res.status(500).json({ error: "Failed to update task" });
@@ -350,9 +407,11 @@ app.delete("/tasks/:id", authOptional, async (req, res) => {
     if (req.user) {
       const result = await pool.query("DELETE FROM tasks WHERE id=$1 AND user_id=$2", [id, req.user.id]);
       if (!result.rowCount) return res.status(404).json({ error: "Task not found" });
+      io.to(`user-${req.user.id}`).emit("task_deleted", { id: Number(id) });
       return res.json({ success: true });
     }
     await pool.query("DELETE FROM tasks WHERE id=$1", [id]);
+    io.emit("task_deleted", { id: Number(id) });
     res.json({ success: true });
   } catch (err) {
     console.error("DELETE /tasks/:id error:", err);
@@ -503,4 +562,4 @@ app.get("/health", (req, res) => {
 
 // Start server
 const PORT = Number(process.env.PORT || 5000);
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
