@@ -560,6 +560,20 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
+// Global error handler middleware
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ 
+    error: "Internal server error",
+    message: process.env.NODE_ENV === 'development' ? err.message : undefined
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: "Route not found" });
+});
+
 // Start server
 const PORT = Number(process.env.PORT || 5000);
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
